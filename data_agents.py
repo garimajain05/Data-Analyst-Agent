@@ -260,7 +260,7 @@ class HypothesisAgent:
         }
         prompt = (
             "You are a data analyst reviewing restaurant feedback data. "
-            "Generate ONE clear, concise hypothesis (2–3 sentences) about the "
+            "Generate ONE clear, concise hypothesis (2-3 sentences) about the "
             "customer experience at this restaurant. Reference specific "
             "percentages and counts from the data. Be direct and analytical.\n\n"
             f"Data:\n{json.dumps(summary, indent=2)}"
