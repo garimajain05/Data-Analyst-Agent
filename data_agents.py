@@ -68,7 +68,7 @@ class CollectorAgent:
         restaurant_name: str,
         location: str = "",
         scan_rows: int = 5000,
-        min_matches: int = 30,
+        min_matches: int = 5,
         max_results: int = 400,
     ) -> tuple[pd.DataFrame, bool]:
         """
