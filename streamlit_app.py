@@ -175,7 +175,7 @@ def render_analysis(analysis: dict, label: str = "") -> None:
                 df_tbs,
                 text_auto=True,
                 color_continuous_scale="RdYlGn",
-                title="Theme × Sentiment Heatmap",
+                title="Theme x Sentiment Heatmap",
                 aspect="auto",
             )
             fig_heat.update_layout(height=320, margin=dict(t=40, b=0))
@@ -197,7 +197,7 @@ def render_analysis(analysis: dict, label: str = "") -> None:
             fig_trend.update_layout(
                 title="Sentiment Trend (rolling avg compound score)",
                 xaxis_title="Review index",
-                yaxis_title="Compound score (−1 to +1)",
+                yaxis_title="Compound score (-1 to +1)",
                 yaxis=dict(range=[-1, 1]),
                 height=320,
                 margin=dict(t=40, b=0),
