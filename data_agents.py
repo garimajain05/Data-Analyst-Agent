@@ -2,22 +2,25 @@
 Multi-agent data analyst pipeline for restaurant reviews.
 
 Agents:
-  CollectorAgent   - retrieves reviews from HuggingFace Yelp dataset at runtime
-  AnalysisAgent    - VADER sentiment + keyword theme extraction + pandas EDA
-  HypothesisAgent - uses Claude claude-sonnet-4-6 (or rule-based fallback) to generate
-                     a data-backed hypothesis
+  CollectorAgent    - fetches real reviews + star ratings via Google Places API
+  AnalysisAgent     - VADER sentiment + keyword theme extraction + pandas EDA
+  HypothesisAgent   - rule-based hypothesis generator (no LLM required)
   OrchestratorAgent - coordinates Collect → EDA → Hypothesize
+
+Data source: Google Places API (Text Search + Place Details)
+  - Fetches up to 5 reviews per restaurant (Google's free-tier limit)
+  - Returns real star ratings (1–5) alongside review text
+  - Dynamic: different restaurant names / locations → different API calls
 """
 
 import json
 import os
+import statistics
 from typing import Optional
 
+import httpx
 import pandas as pd
-from datasets import load_dataset
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
-
-import anthropic
 
 # ---------------------------------------------------------------------------
 # Theme keyword map
@@ -48,82 +51,157 @@ THEME_KEYWORDS: dict[str, list[str]] = {
     ],
 }
 
+GOOGLE_PLACES_BASE = "https://maps.googleapis.com/maps/api/place"
+
 
 # ---------------------------------------------------------------------------
 # CollectorAgent
 # ---------------------------------------------------------------------------
 class CollectorAgent:
     """
-    Retrieves Yelp reviews from HuggingFace `yelp_review_full` at runtime.
+    Retrieves real restaurant reviews via the Google Places API at runtime.
 
     Strategy:
-      1. Stream the first `scan_rows` rows from the training split.
-      2. Filter rows whose text mentions any token from restaurant_name.
-      3. If fewer than `min_matches` are found, fall back to a random sample
-         of the scanned rows (so analysis still runs on real data).
+      1. Text Search → find the best-matching place_id for the query.
+      2. Place Details → fetch up to 5 reviews (Google's public limit) and
+         the overall star rating for that place.
+      3. Returns a DataFrame with columns [text, stars, author, time_desc]
+         plus a metadata dict (place name, overall rating, total ratings).
+
+    If GOOGLE_PLACES_API_KEY is not set, a small set of clearly-labelled
+    placeholder rows is returned so the rest of the pipeline can still run.
     """
+
+    def __init__(self) -> None:
+        self.api_key = os.environ.get("GOOGLE_PLACES_API_KEY", "")
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _text_search(self, query: str) -> Optional[str]:
+        """Return the place_id for the top result of a text search."""
+        url = f"{GOOGLE_PLACES_BASE}/textsearch/json"
+        params = {"query": query, "type": "restaurant", "key": self.api_key}
+        resp = httpx.get(url, params=params, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        results = data.get("results", [])
+        if not results:
+            return None
+        return results[0]["place_id"]
+
+    def _place_details(self, place_id: str) -> dict:
+        """Fetch place name, overall rating, user_ratings_total, and reviews."""
+        url = f"{GOOGLE_PLACES_BASE}/details/json"
+        params = {
+            "place_id": place_id,
+            "fields": "name,rating,user_ratings_total,reviews",
+            "key": self.api_key,
+        }
+        resp = httpx.get(url, params=params, timeout=10)
+        resp.raise_for_status()
+        return resp.json().get("result", {})
+
+    def _placeholder_df(self, restaurant_name: str) -> tuple[pd.DataFrame, dict]:
+        """Used when no API key is configured."""
+        rows = [
+            {
+                "text": "The food here is absolutely amazing, best I have had in years!",
+                "stars": 5,
+                "author": "Sample Reviewer A",
+                "time_desc": "a week ago",
+            },
+            {
+                "text": "Service was a bit slow but the food quality made up for it.",
+                "stars": 4,
+                "author": "Sample Reviewer B",
+                "time_desc": "2 weeks ago",
+            },
+            {
+                "text": "Overpriced and the wait time was ridiculous. Disappointed.",
+                "stars": 2,
+                "author": "Sample Reviewer C",
+                "time_desc": "a month ago",
+            },
+            {
+                "text": "Cozy ambience and friendly staff. Will definitely come back.",
+                "stars": 4,
+                "author": "Sample Reviewer D",
+                "time_desc": "a month ago",
+            },
+            {
+                "text": "Decent meal but nothing special. Average experience overall.",
+                "stars": 3,
+                "author": "Sample Reviewer E",
+                "time_desc": "2 months ago",
+            },
+        ]
+        df = pd.DataFrame(rows)
+        meta = {
+            "place_name": restaurant_name + " (placeholder – add GOOGLE_PLACES_API_KEY)",
+            "overall_rating": round(
+                sum(r["stars"] for r in rows) / len(rows), 1
+            ),
+            "total_ratings": len(rows),
+            "is_placeholder": True,
+        }
+        return df, meta
+
+    # ------------------------------------------------------------------
+    # Public interface
+    # ------------------------------------------------------------------
 
     def collect_reviews(
         self,
         restaurant_name: str,
         location: str = "",
-        scan_rows: int = 5000,
-        min_matches: int = 5,
-        max_results: int = 400,
-    ) -> tuple[pd.DataFrame, bool]:
+    ) -> tuple[pd.DataFrame, dict]:
         """
-        Returns (dataframe, was_filtered).
-        `was_filtered=True` means we found reviews mentioning the restaurant name.
-        `was_filtered=False` means we fell back to a random sample.
-
-        Each restaurant gets a deterministic but distinct slice of the dataset
-        via a name-derived skip offset, so different queries return different data.
+        Returns (dataframe, metadata).
+        dataframe columns: text, stars, author, time_desc
+        metadata keys: place_name, overall_rating, total_ratings, is_placeholder
         """
-        # Derive a skip offset from the restaurant name so different queries
-        # read different portions of the 650k-row dataset.
-        name_seed = abs(hash(restaurant_name.lower())) % 600_000
-        # Keep offset within a range that still leaves room for scan_rows rows
-        skip = min(name_seed, 650_000 - scan_rows - 1)
+        if not self.api_key:
+            return self._placeholder_df(restaurant_name)
 
-        dataset = load_dataset(
-            "yelp_review_full",
-            split="train",
-            streaming=True,
-        )
+        query = restaurant_name
+        if location.strip():
+            query = f"{restaurant_name} {location}"
 
-        query_tokens = [
-            tok for tok in restaurant_name.lower().split() if len(tok) > 3
+        place_id = self._text_search(query)
+        if place_id is None:
+            return self._placeholder_df(restaurant_name)
+
+        details = self._place_details(place_id)
+        raw_reviews = details.get("reviews", [])
+
+        rows = [
+            {
+                "text": r.get("text", ""),
+                "stars": r.get("rating", 3),          # per-review star rating
+                "author": r.get("author_name", ""),
+                "time_desc": r.get("relative_time_description", ""),
+            }
+            for r in raw_reviews
+            if r.get("text", "").strip()
         ]
 
-        rows: list[dict] = []
-        matched: list[dict] = []
+        if not rows:
+            return self._placeholder_df(restaurant_name)
 
-        for i, row in enumerate(dataset):
-            if i < skip:
-                continue
-            if i >= skip + scan_rows:
-                break
-            record = {"text": row["text"], "stars": row["label"] + 1}
-            rows.append(record)
-            if query_tokens:
-                text_lower = row["text"].lower()
-                if any(tok in text_lower for tok in query_tokens):
-                    matched.append(record)
-                    if len(matched) >= max_results:
-                        break
-
-        if len(matched) >= min_matches:
-            return pd.DataFrame(matched[:max_results]), True
-
-        # Fallback: random sample using name-derived seed so results differ per restaurant
-        name_random_seed = abs(hash(restaurant_name.lower())) % (2**31)
-        df_all = pd.DataFrame(rows)
-        sample = df_all.sample(min(200, len(df_all)), random_state=name_random_seed)
-        return sample, False
+        df = pd.DataFrame(rows)
+        meta = {
+            "place_name": details.get("name", restaurant_name),
+            "overall_rating": details.get("rating"),          # Google's aggregate score
+            "total_ratings": details.get("user_ratings_total"),
+            "is_placeholder": False,
+        }
+        return df, meta
 
     def run(
         self, restaurant_name: str, location: str = ""
-    ) -> tuple[pd.DataFrame, bool]:
+    ) -> tuple[pd.DataFrame, dict]:
         return self.collect_reviews(restaurant_name, location)
 
 
@@ -132,14 +210,23 @@ class CollectorAgent:
 # ---------------------------------------------------------------------------
 class AnalysisAgent:
     """
-    Performs EDA on a review dataframe:
-      - VADER sentiment classification (positive / neutral / negative)
-      - Keyword-based theme detection
-      - Pandas aggregations: counts, percentages, grouped stats, trends
+    Performs EDA on the collected review DataFrame.
+
+    Tool calls implemented as distinct methods so they can be wired as
+    agent tools in any framework:
+      - compute_sentiment_distribution
+      - compute_theme_frequency
+      - compute_theme_by_sentiment
+      - compute_rating_distribution
+      - compute_sentiment_trend
     """
 
     def __init__(self) -> None:
         self.sia = SentimentIntensityAnalyzer()
+
+    # ------------------------------------------------------------------
+    # Deterministic NLP helpers
+    # ------------------------------------------------------------------
 
     def _classify_sentiment(self, text: str) -> str:
         score = self.sia.polarity_scores(text)["compound"]
@@ -149,6 +236,9 @@ class AnalysisAgent:
             return "negative"
         return "neutral"
 
+    def _compound_score(self, text: str) -> float:
+        return self.sia.polarity_scores(text)["compound"]
+
     def _extract_themes(self, text: str) -> list[str]:
         text_lower = text.lower()
         return [
@@ -157,161 +247,197 @@ class AnalysisAgent:
             if any(kw in text_lower for kw in keywords)
         ]
 
-    def analyze(self, df: pd.DataFrame, restaurant_name: str) -> dict:
-        df = df.copy()
+    # ------------------------------------------------------------------
+    # EDA tool methods (each surfaces a specific finding)
+    # ------------------------------------------------------------------
 
-        # --- sentiment ---
-        df["sentiment"] = df["text"].apply(self._classify_sentiment)
-        df["compound"] = df["text"].apply(
-            lambda t: self.sia.polarity_scores(t)["compound"]
-        )
-
-        # --- themes ---
-        df["themes"] = df["text"].apply(self._extract_themes)
-
+    def compute_sentiment_distribution(self, df: pd.DataFrame) -> dict:
+        """Tool: count and percentage of positive / neutral / negative reviews."""
         total = len(df)
-
-        # Sentiment distribution
-        sentiment_counts: dict = df["sentiment"].value_counts().to_dict()
+        counts = df["sentiment"].value_counts().to_dict()
         for s in ("positive", "neutral", "negative"):
-            sentiment_counts.setdefault(s, 0)
-        sentiment_pct = {
-            k: round(v / total * 100, 1) for k, v in sentiment_counts.items()
-        }
+            counts.setdefault(s, 0)
+        pct = {k: round(v / total * 100, 1) for k, v in counts.items()}
+        return {"counts": counts, "pct": pct}
 
-        # Theme frequency
+    def compute_theme_frequency(self, df: pd.DataFrame) -> dict:
+        """Tool: how often each theme appears across reviews (%)."""
+        total = len(df)
         theme_counts = {theme: 0 for theme in THEME_KEYWORDS}
         for themes in df["themes"]:
             for t in themes:
                 theme_counts[t] += 1
         theme_pct = {k: round(v / total * 100, 1) for k, v in theme_counts.items()}
+        return {"counts": theme_counts, "pct": theme_pct}
 
-        # Theme × sentiment grouped stats
-        theme_by_sentiment: dict = {}
+    def compute_theme_by_sentiment(self, df: pd.DataFrame) -> dict:
+        """Tool: for each theme, breakdown of positive/neutral/negative reviews."""
+        result = {}
         for theme in THEME_KEYWORDS:
             theme_df = df[df["themes"].apply(lambda x: theme in x)]
             if len(theme_df) > 0:
-                theme_by_sentiment[theme] = (
-                    theme_df["sentiment"].value_counts().to_dict()
-                )
+                result[theme] = theme_df["sentiment"].value_counts().to_dict()
+        return result
 
-        # Rating stats
-        avg_rating = round(df["stars"].mean(), 2)
-        rating_dist = df["stars"].value_counts().sort_index().to_dict()
+    def compute_rating_distribution(self, df: pd.DataFrame) -> dict:
+        """Tool: count of reviews per star rating."""
+        dist = df["stars"].value_counts().sort_index().to_dict()
+        return {int(k): int(v) for k, v in dist.items()}
 
-        # Trend: rolling avg compound score (window=20)
-        rolling_avg = (
-            df["compound"].rolling(window=20, min_periods=1).mean().tolist()
-        )
-        # Sample every 10th point to keep payload small
-        trend_points = rolling_avg[::10]
+    def compute_sentiment_trend(self, df: pd.DataFrame) -> list[float]:
+        """Tool: rolling average compound score (window=3 for small datasets)."""
+        window = min(3, max(1, len(df) // 2))
+        rolling = df["compound"].rolling(window=window, min_periods=1).mean()
+        return [round(v, 4) for v in rolling.tolist()]
 
-        # Top and bottom reviews
+    # ------------------------------------------------------------------
+    # Main analysis entry point
+    # ------------------------------------------------------------------
+
+    def analyze(self, df: pd.DataFrame, restaurant_name: str, meta: dict) -> dict:
+        df = df.copy()
+
+        # Augment with derived columns
+        df["sentiment"] = df["text"].apply(self._classify_sentiment)
+        df["compound"] = df["text"].apply(self._compound_score)
+        df["themes"] = df["text"].apply(self._extract_themes)
+
+        total = len(df)
+
+        # Run each EDA tool
+        sentiment_result = self.compute_sentiment_distribution(df)
+        theme_result = self.compute_theme_frequency(df)
+        theme_by_sentiment = self.compute_theme_by_sentiment(df)
+        rating_dist = self.compute_rating_distribution(df)
+        trend = self.compute_sentiment_trend(df)
+
+        # Top / bottom reviews by compound score
         top_idx = df["compound"].idxmax()
         bot_idx = df["compound"].idxmin()
-        top_review = df.loc[top_idx, "text"][:400]
-        bottom_review = df.loc[bot_idx, "text"][:400]
+
+        # Use Google's overall rating if available, else compute from reviews
+        overall_rating = meta.get("overall_rating") or round(df["stars"].mean(), 1)
 
         return {
-            "restaurant_name": restaurant_name,
+            "restaurant_name": meta.get("place_name", restaurant_name),
+            "query_name": restaurant_name,
             "total_reviews": total,
-            "avg_rating": avg_rating,
-            "rating_distribution": {int(k): int(v) for k, v in rating_dist.items()},
-            "sentiment_counts": sentiment_counts,
-            "sentiment_pct": sentiment_pct,
-            "theme_counts": theme_counts,
-            "theme_pct": theme_pct,
+            "overall_rating": overall_rating,        # Google aggregate (may cover 1000s of reviews)
+            "total_ratings_on_google": meta.get("total_ratings"),
+            "avg_rating_from_sample": round(df["stars"].mean(), 2),
+            "rating_distribution": rating_dist,
+            "sentiment_counts": sentiment_result["counts"],
+            "sentiment_pct": sentiment_result["pct"],
+            "theme_counts": theme_result["counts"],
+            "theme_pct": theme_result["pct"],
             "theme_by_sentiment": theme_by_sentiment,
-            "sentiment_trend": trend_points,
-            "top_review": top_review,
-            "bottom_review": bottom_review,
+            "sentiment_trend": trend,
+            "top_review": {
+                "text": df.loc[top_idx, "text"],
+                "stars": int(df.loc[top_idx, "stars"]),
+                "author": df.loc[top_idx, "author"],
+            },
+            "bottom_review": {
+                "text": df.loc[bot_idx, "text"],
+                "stars": int(df.loc[bot_idx, "stars"]),
+                "author": df.loc[bot_idx, "author"],
+            },
+            "all_reviews": df[["text", "stars", "author", "time_desc", "sentiment", "compound"]]
+                .to_dict(orient="records"),
+            "is_placeholder": meta.get("is_placeholder", False),
         }
 
-    def run(self, df: pd.DataFrame, restaurant_name: str) -> dict:
-        return self.analyze(df, restaurant_name)
+    def run(self, df: pd.DataFrame, restaurant_name: str, meta: dict) -> dict:
+        return self.analyze(df, restaurant_name, meta)
 
 
 # ---------------------------------------------------------------------------
-# HypothesisAgent
+# HypothesisAgent  (rule-based, no LLM)
 # ---------------------------------------------------------------------------
 class HypothesisAgent:
     """
-    Generates a data-backed hypothesis using Claude claude-sonnet-4-6.
-    Falls back to a rule-based statement when ANTHROPIC_API_KEY is not set.
+    Forms a data-backed hypothesis from the EDA output using deterministic
+    rules.  No LLM / API key required.
+
+    Rules (in priority order):
+      1. Strong positive signal  (positive% ≥ 60)
+      2. Strong negative signal  (negative% ≥ 40)
+      3. Mixed / balanced signal
+
+    The hypothesis references specific numbers from the analysis so it is
+    grounded in the collected data, not model weights.
     """
 
-    def __init__(self) -> None:
-        api_key = os.environ.get("ANTHROPIC_API_KEY")
-        self.client = anthropic.Anthropic(api_key=api_key) if api_key else None
-
     def generate_hypothesis(self, analysis: dict) -> str:
-        if self.client:
-            return self._claude_hypothesis(analysis)
-        return self._rule_based_hypothesis(analysis)
-
-    def _claude_hypothesis(self, analysis: dict) -> str:
-        summary = {
-            "restaurant": analysis["restaurant_name"],
-            "total_reviews": analysis["total_reviews"],
-            "avg_rating": analysis["avg_rating"],
-            "sentiment_pct": analysis["sentiment_pct"],
-            "theme_pct": analysis["theme_pct"],
-            "theme_by_sentiment": analysis["theme_by_sentiment"],
-        }
-        prompt = (
-            "You are a data analyst reviewing restaurant feedback data. "
-            "Generate ONE clear, concise hypothesis (2-3 sentences) about the "
-            "customer experience at this restaurant. Reference specific "
-            "percentages and counts from the data. Be direct and analytical.\n\n"
-            f"Data:\n{json.dumps(summary, indent=2)}"
-        )
-        message = self.client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=300,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        return message.content[0].text
-
-    def _rule_based_hypothesis(self, analysis: dict) -> str:
-        sp = analysis.get("sentiment_pct", {})
-        tp = analysis.get("theme_pct", {})
+        sp = analysis["sentiment_pct"]
+        tp = analysis["theme_pct"]
         pos = sp.get("positive", 0)
         neg = sp.get("negative", 0)
+        neu = sp.get("neutral", 0)
+        total = analysis["total_reviews"]
+        name = analysis["restaurant_name"]
+        avg = analysis["avg_rating_from_sample"]
+        overall = analysis.get("overall_rating")
+        total_google = analysis.get("total_ratings_on_google")
+
+        # Most-mentioned theme
         top_theme = max(tp, key=lambda k: tp[k]) if tp else "food_quality"
         top_label = top_theme.replace("_", " ")
         top_pct = tp.get(top_theme, 0)
 
+        # Most negatively-skewed theme
         tbs = analysis.get("theme_by_sentiment", {})
-
-        # Find most negatively-associated theme
-        worst_theme, worst_neg = top_theme, 0
+        worst_theme = top_theme
+        worst_neg_ratio = 0.0
         for theme, counts in tbs.items():
-            n = counts.get("negative", 0)
             tot = sum(counts.values()) or 1
-            if n / tot > worst_neg / max(sum(tbs.get(worst_theme, {}).values()), 1):
-                worst_theme, worst_neg = theme, n
+            ratio = counts.get("negative", 0) / tot
+            if ratio > worst_neg_ratio:
+                worst_theme, worst_neg_ratio = theme, ratio
+        worst_label = worst_theme.replace("_", " ")
 
+        # Google overall rating context
+        google_ctx = ""
+        if overall and total_google:
+            google_ctx = (
+                f" (Google overall: {overall}/5 across "
+                f"{total_google:,} ratings)"
+            )
+        elif overall:
+            google_ctx = f" (Google overall rating: {overall}/5)"
+
+        # --- Rule 1: clearly positive ---
         if pos >= 60:
             return (
-                f"Customer satisfaction at {analysis['restaurant_name']} is driven "
-                f"primarily by {top_label} ({top_pct:.1f}% of reviews mention it), "
-                f"with {pos:.1f}% of reviews expressing positive sentiment overall "
-                f"and an average rating of {analysis['avg_rating']}/5."
+                f"Based on {total} sampled reviews, {name} enjoys a "
+                f"strongly positive reception{google_ctx}. "
+                f"{pos:.0f}% of reviews express positive sentiment with an "
+                f"average sample rating of {avg}/5. "
+                f"The most-discussed topic is {top_label} ({top_pct:.0f}% of "
+                f"reviews), suggesting it is the primary driver of customer "
+                f"satisfaction."
             )
+
+        # --- Rule 2: clearly negative ---
         if neg >= 40:
-            worst_label = worst_theme.replace("_", " ")
             return (
-                f"Negative reviews ({neg:.1f}%) at {analysis['restaurant_name']} "
-                f"are concentrated around {worst_label}, suggesting it is the "
-                f"primary pain point. Positive sentiment accounts for only "
-                f"{pos:.1f}% despite an average rating of {analysis['avg_rating']}/5."
+                f"Based on {total} sampled reviews, {name} faces notable "
+                f"customer dissatisfaction{google_ctx}. "
+                f"{neg:.0f}% of reviews are negative and only {pos:.0f}% are "
+                f"positive, despite an average sample rating of {avg}/5. "
+                f"The theme most associated with negative sentiment is "
+                f"{worst_label}, which appears to be the primary pain point."
             )
+
+        # --- Rule 3: mixed ---
         return (
-            f"Reviews for {analysis['restaurant_name']} are mixed "
-            f"({pos:.1f}% positive, {neg:.1f}% negative). "
-            f"{top_label.title()} is the most discussed topic "
-            f"({top_pct:.1f}% of reviews), pointing to it as the key driver "
-            f"of overall customer experience."
+            f"Reviews for {name} are mixed{google_ctx}: "
+            f"{pos:.0f}% positive, {neg:.0f}% negative, {neu:.0f}% neutral "
+            f"across {total} sampled reviews (avg {avg}/5). "
+            f"{top_label.title()} is the most discussed theme "
+            f"({top_pct:.0f}% of reviews), and {worst_label} shows the "
+            f"highest proportion of negative mentions, suggesting it as the "
+            f"key area for improvement."
         )
 
     def run(self, analysis: dict) -> str:
@@ -324,7 +450,7 @@ class HypothesisAgent:
 class OrchestratorAgent:
     """
     Top-level orchestrator: Collect → EDA → Hypothesize.
-    Supports optional comparison restaurant.
+    Supports optional comparison restaurant (fan-out pattern).
     """
 
     def __init__(self) -> None:
@@ -333,10 +459,15 @@ class OrchestratorAgent:
         self.hypothesis_agent = HypothesisAgent()
 
     def _process(self, restaurant_name: str, location: str) -> dict:
-        df, was_filtered = self.collector.run(restaurant_name, location)
-        analysis = self.analyst.run(df, restaurant_name)
-        analysis["was_filtered"] = was_filtered
+        # Step 1: Collect
+        df, meta = self.collector.run(restaurant_name, location)
+
+        # Step 2: EDA
+        analysis = self.analyst.run(df, restaurant_name, meta)
+
+        # Step 3: Hypothesize
         analysis["hypothesis"] = self.hypothesis_agent.run(analysis)
+
         return analysis
 
     def run(

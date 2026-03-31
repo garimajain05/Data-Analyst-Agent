@@ -2,8 +2,8 @@
 FastAPI backend for the restaurant review analyst.
 
 Endpoints:
-  GET  /           – health check
-  POST /analyze    – run the full Collect → EDA → Hypothesize pipeline
+  GET  /           - health check
+  POST /analyze    - run the full Collect → EDA → Hypothesize pipeline
 """
 
 from typing import Optional
@@ -16,8 +16,11 @@ from data_agents import OrchestratorAgent
 
 app = FastAPI(
     title="Restaurant Review Analyst API",
-    description="Multi-agent system: CollectorAgent → AnalysisAgent → HypothesisAgent",
-    version="0.1.0",
+    description=(
+        "Multi-agent system: CollectorAgent (Google Places API) → "
+        "AnalysisAgent (VADER EDA) → HypothesisAgent (rule-based)"
+    ),
+    version="0.2.0",
 )
 
 app.add_middleware(
@@ -39,7 +42,7 @@ class AnalyzeRequest(BaseModel):
 
 @app.get("/")
 def health() -> dict:
-    return {"status": "ok", "service": "restaurant-review-analyst"}
+    return {"status": "ok", "service": "restaurant-review-analyst-v2"}
 
 
 @app.post("/analyze")
