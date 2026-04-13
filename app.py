@@ -6,6 +6,12 @@ Endpoints:
   POST /analyze    - run the full Collect → EDA → Hypothesize pipeline
 """
 
+from dotenv import load_dotenv
+
+load_dotenv(override=True)  # override=True forces .env values even if already in env
+
+import os
+
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException
@@ -43,6 +49,16 @@ class AnalyzeRequest(BaseModel):
 @app.get("/")
 def health() -> dict:
     return {"status": "ok", "service": "restaurant-review-analyst-v2"}
+
+
+@app.get("/debug")
+def debug() -> dict:
+    """Verify env vars are loaded correctly (masks key value)."""
+    key = os.environ.get("GOOGLE_PLACES_API_KEY", "")
+    return {
+        "GOOGLE_PLACES_API_KEY_set": bool(key),
+        "GOOGLE_PLACES_API_KEY_preview": f"{key[:6]}…" if key else "(not set)",
+    }
 
 
 @app.post("/analyze")

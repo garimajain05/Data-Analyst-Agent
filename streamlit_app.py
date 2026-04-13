@@ -136,7 +136,7 @@ def render_analysis(analysis: dict, label: str = "") -> None:
             height=320,
             margin=dict(t=40, b=0),
         )
-        st.plotly_chart(fig_pie, use_container_width=True)
+        st.plotly_chart(fig_pie, use_container_width=True, key=f"pie_{name}")
 
     with col_r:
         tp = analysis["theme_pct"]
@@ -153,7 +153,7 @@ def render_analysis(analysis: dict, label: str = "") -> None:
             showlegend=False,
             margin=dict(t=40, b=0),
         )
-        st.plotly_chart(fig_bar, use_container_width=True)
+        st.plotly_chart(fig_bar, use_container_width=True, key=f"theme_bar_{name}")
 
     # ── Row 2: theme × sentiment heatmap + sentiment trend ──────────────────
     col_a, col_b = st.columns(2)
@@ -179,7 +179,7 @@ def render_analysis(analysis: dict, label: str = "") -> None:
                 aspect="auto",
             )
             fig_heat.update_layout(height=320, margin=dict(t=40, b=0))
-            st.plotly_chart(fig_heat, use_container_width=True)
+            st.plotly_chart(fig_heat, use_container_width=True, key=f"heat_{name}")
 
     with col_b:
         trend = analysis.get("sentiment_trend", [])
@@ -202,7 +202,7 @@ def render_analysis(analysis: dict, label: str = "") -> None:
                 height=320,
                 margin=dict(t=40, b=0),
             )
-            st.plotly_chart(fig_trend, use_container_width=True)
+            st.plotly_chart(fig_trend, use_container_width=True, key=f"trend_{name}")
 
     # ── Rating distribution ──────────────────────────────────────────────────
     rd = analysis.get("rating_distribution", {})
@@ -220,7 +220,7 @@ def render_analysis(analysis: dict, label: str = "") -> None:
             showlegend=False,
             margin=dict(t=40, b=0),
         )
-        st.plotly_chart(fig_rd, use_container_width=True)
+        st.plotly_chart(fig_rd, use_container_width=True, key=f"rating_dist_{name}")
 
     # ── Individual reviews ───────────────────────────────────────────────────
     st.subheader("📝 Fetched Reviews")

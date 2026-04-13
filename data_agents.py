@@ -9,7 +9,7 @@ Agents:
 
 Data source: Google Places API (Text Search + Place Details)
   - Fetches up to 5 reviews per restaurant (Google's free-tier limit)
-  - Returns real star ratings (1–5) alongside review text
+  - Returns real star ratings (1-5) alongside review text
   - Dynamic: different restaurant names / locations → different API calls
 """
 
@@ -73,7 +73,11 @@ class CollectorAgent:
     """
 
     def __init__(self) -> None:
-        self.api_key = os.environ.get("GOOGLE_PLACES_API_KEY", "")
+        pass  # api_key is read lazily per-request so .env changes take effect
+
+    @property
+    def api_key(self) -> str:
+        return os.environ.get("GOOGLE_PLACES_API_KEY", "")
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -139,7 +143,7 @@ class CollectorAgent:
         ]
         df = pd.DataFrame(rows)
         meta = {
-            "place_name": restaurant_name + " (placeholder – add GOOGLE_PLACES_API_KEY)",
+            "place_name": restaurant_name + " (placeholder - add GOOGLE_PLACES_API_KEY)",
             "overall_rating": round(
                 sum(r["stars"] for r in rows) / len(rows), 1
             ),
