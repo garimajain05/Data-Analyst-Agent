@@ -282,4 +282,4 @@ Data-Analyst-Agent/
 - **Text Search**: finds place_id from a free-text query (name + optional city).
 - **Place Details**: returns `name`, `rating` (aggregate), `user_ratings_total`, and up to **5 `reviews`** (each with `text`, `rating`, `author_name`, `relative_time_description`).
 - **Free tier**: $200/month credit → ~40,000 Text Search calls or ~17,000 Place Details calls per month.
-- Get a key: [console.cloud.google.com](https://console.cloud.google.com/) → Enable "Places API".
+- Get a key: [console.cloud.google.com/apis](https://console.cloud.google.com/apis) → Enable "Places API".
