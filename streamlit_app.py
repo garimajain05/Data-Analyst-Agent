@@ -34,7 +34,7 @@ st.caption(
 with st.sidebar:
     st.header("Query")
     restaurant = st.text_input("Restaurant name", placeholder="e.g. Shake Shack")
-    location = st.text_input("Location (optional)", placeholder="e.g. New York")
+    location = st.text_input("Location", placeholder="e.g. New York")
     compare = st.text_input(
         "Compare with (optional)", placeholder="e.g. Five Guys"
     )
