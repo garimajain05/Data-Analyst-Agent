@@ -129,27 +129,140 @@ curl -X POST http://localhost:8000/analyze \
   -d '{"restaurant_name":"Shake Shack","location":"New York"}'
 ```
 
-## Deployment
+## Deployment (Google Cloud Run)
 
-### Backend (Render / Railway / Fly)
+Both services deploy via Cloud Build. The API key is stored in **Secret Manager** — never hardcoded in any file.
+
+### Prerequisites
+
+- [gcloud CLI](https://cloud.google.com/sdk) installed and authenticated
+- A GCP project with billing enabled
 
 ```bash
-# start command:
-uvicorn app:app --host 0.0.0.0 --port $PORT
-# environment variables: GOOGLE_PLACES_API_KEY
+gcloud auth login
+gcloud config set project YOUR_PROJECT_ID
 ```
 
-### Frontend (Streamlit Community Cloud)
+### Step 1 — Enable Required APIs
 
-1. Push repo to GitHub.
-2. [share.streamlit.io](https://share.streamlit.io) → New app → select `streamlit_app.py`.
-3. Add secrets: `API_URL = https://your-backend.onrender.com`.
+```bash
+gcloud services enable \
+  cloudbuild.googleapis.com \
+  run.googleapis.com \
+  secretmanager.googleapis.com \
+  containerregistry.googleapis.com \
+  places-backend.googleapis.com \
+  places.googleapis.com
+```
+
+### Step 2 — Get Your Google Places API Key
+
+1. Go to [console.cloud.google.com](https://console.cloud.google.com) → **APIs & Services → Credentials**
+2. Click **+ Create Credentials → API Key** and copy the key
+3. Optional but recommended: click **Restrict Key** and limit it to the Places API only
+
+### Step 3 — Store the Key in Secret Manager
+
+```bash
+# Store the key (replace with your actual key)
+echo -n "YOUR_API_KEY_HERE" | \
+  gcloud secrets create GOOGLE_PLACES_API_KEY \
+    --data-file=- \
+    --replication-policy=automatic
+
+# Verify it was stored correctly
+gcloud secrets versions access latest --secret=GOOGLE_PLACES_API_KEY
+```
+
+To update the key later:
+
+```bash
+echo -n "NEW_API_KEY" | \
+  gcloud secrets versions add GOOGLE_PLACES_API_KEY --data-file=-
+```
+
+### Step 4 — Grant Cloud Run Access to the Secret
+
+```bash
+PROJECT_NUMBER=$(gcloud projects describe \
+  $(gcloud config get-value project) \
+  --format='value(projectNumber)')
+
+gcloud secrets add-iam-policy-binding GOOGLE_PLACES_API_KEY \
+  --member="serviceAccount:${PROJECT_NUMBER}-compute@developer.gserviceaccount.com" \
+  --role="roles/secretmanager.secretAccessor"
+```
+
+### Step 5 — Deploy the Backend
+
+```bash
+gcloud builds submit --config cloudbuild-backend.yaml .
+```
+
+Note the service URL printed at the end (e.g. `https://data-analyst-backend-XXX.us-central1.run.app`).
+
+Verify it's working:
+
+```bash
+# Should return {"GOOGLE_PLACES_API_KEY_set": true, ...}
+curl https://YOUR-BACKEND-URL/debug
+
+# Full test with real reviews
+curl -X POST https://YOUR-BACKEND-URL/analyze \
+  -H 'Content-Type: application/json' \
+  -d '{"restaurant_name":"Shake Shack","location":"New York"}'
+```
+
+### Step 6 — Deploy the Frontend
+
+Open `cloudbuild-frontend.yaml` and update `API_URL` to your backend URL from Step 5, then:
+
+```bash
+gcloud builds submit --config cloudbuild-frontend.yaml .
+```
+
+The frontend URL will be printed when the build completes.
+
+---
+
+### Troubleshooting
+
+**Still seeing placeholder reviews after deployment?**
+
+```bash
+# 1. Confirm the secret exists
+gcloud secrets versions access latest --secret=GOOGLE_PLACES_API_KEY
+
+# 2. Check the debug endpoint
+curl https://YOUR-BACKEND-URL/debug
+
+# 3. If a previous deploy used --set-env-vars instead of --update-secrets, remove it
+gcloud run services update data-analyst-backend \
+  --region=us-central1 \
+  --remove-env-vars=GOOGLE_PLACES_API_KEY
+
+# Then redeploy
+gcloud builds submit --config cloudbuild-backend.yaml .
+```
+
+**`Cannot update environment variable` error during deploy?**
+A plain env var and a secret are colliding. Run the `--remove-env-vars` command above first.
+
+**`PROJECT_NUMBER` is empty?**
+
+```bash
+# Run the two lines separately to debug
+gcloud config get-value project
+gcloud projects describe YOUR_PROJECT_ID --format='value(projectNumber)'
+```
+
+---
 
 ## Environment Variables
 
 | Variable | Required | Description |
 |---|---|---|
-| `GOOGLE_PLACES_API_KEY` | **Yes** (for live data) | Google Places API key. Without it, placeholder reviews are used. |
+| `GOOGLE_PLACES_API_KEY` | **Yes** (for live data) | Injected from Secret Manager in Cloud Run. Set in `.env` for local dev. |
 | `API_URL` | No | Backend URL for Streamlit (default: `http://localhost:8000`) |
 
 ## Project Structure
