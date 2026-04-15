@@ -1,17 +1,17 @@
 steps:
   - name: 'gcr.io/cloud-builders/docker'
-    args: ['build', '-f', 'Dockerfile.frontend', '-t', 'gcr.io/$PROJECT_ID/data-analyst-frontend', '.']
+    args: ['build', '-f', 'Dockerfile.frontend', '-t', 'gcr.io/$PROJECT_ID/data-analyst-frontend-v2', '.']
 
   - name: 'gcr.io/cloud-builders/docker'
-    args: ['push', 'gcr.io/$PROJECT_ID/data-analyst-frontend']
+    args: ['push', 'gcr.io/$PROJECT_ID/data-analyst-frontend-v2']
 
   - name: 'gcr.io/cloud-builders/gcloud'
     args:
       - 'run'
       - 'deploy'
-      - 'data-analyst-frontend'
-      - '--image=gcr.io/$PROJECT_ID/data-analyst-frontend'
+      - 'data-analyst-frontend-v2'
+      - '--image=gcr.io/$PROJECT_ID/data-analyst-frontend-v2'
       - '--region=us-central1'
       - '--allow-unauthenticated'
       - '--port=8080'
-      - '--set-env-vars=API_URL=https://data-analyst-backend-940502312023.us-central1.run.app'
+      - '--set-env-vars=API_URL=https://data-analyst-backend-v2-940502312023.us-central1.run.app'

@@ -4,8 +4,17 @@ Multi-agent data analyst pipeline for restaurant reviews.
 Agents:
   CollectorAgent    - fetches real reviews + star ratings via Google Places API
   AnalysisAgent     - VADER sentiment + keyword theme extraction + pandas EDA
-  HypothesisAgent   - rule-based hypothesis generator (no LLM required)
+  HypothesisAgent   - PydanticAI agent (Claude claude-haiku-4-5) with tool-calling;
+                      falls back to rule-based logic when ANTHROPIC_API_KEY is not set
   OrchestratorAgent - coordinates Collect → EDA → Hypothesize
+
+Agent framework: PydanticAI (pydantic-ai) — https://ai.pydantic.dev/
+  HypothesisAgent is a PydanticAI Agent backed by Claude claude-haiku-4-5 via the
+  Anthropic API.  It calls three @agent.tool-decorated functions
+  (get_sentiment_data, get_theme_data, get_rating_data) that receive analysis
+  results through PydanticAI's typed dependency-injection system (RunContext),
+  then synthesises a data-backed hypothesis.
+  Set ANTHROPIC_API_KEY to enable the LLM path.
 
 Data source: Google Places API (Text Search + Place Details)
   - Fetches up to 5 reviews per restaurant (Google's free-tier limit)
@@ -13,14 +22,70 @@ Data source: Google Places API (Text Search + Place Details)
   - Dynamic: different restaurant names / locations → different API calls
 """
 
-import json
 import os
 import statistics
+from dataclasses import dataclass
 from typing import Optional
 
 import httpx
 import pandas as pd
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+
+# ---------------------------------------------------------------------------
+# PydanticAI setup
+# ---------------------------------------------------------------------------
+try:
+    from pydantic_ai import Agent, RunContext
+    _PYDANTIC_AI_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    _PYDANTIC_AI_AVAILABLE = False
+
+
+@dataclass
+class HypothesisDeps:
+    """Typed dependency injected into every PydanticAI tool call."""
+    analysis: dict
+
+
+if _PYDANTIC_AI_AVAILABLE:
+    # Tool functions are defined here at module level so they are importable
+    # and inspectable.  The Agent itself is created lazily inside
+    # HypothesisAgent._pydanticai_hypothesis() so that the Anthropic provider
+    # does not attempt to read ANTHROPIC_API_KEY at import time.
+
+    def get_sentiment_data(ctx: "RunContext[HypothesisDeps]") -> dict:
+        """Return sentiment distribution percentages and counts from the reviews."""
+        return {
+            "sentiment_pct": ctx.deps.analysis.get("sentiment_pct", {}),
+            "sentiment_counts": ctx.deps.analysis.get("sentiment_counts", {}),
+            "total_reviews": ctx.deps.analysis.get("total_reviews", 0),
+        }
+
+    def get_theme_data(ctx: "RunContext[HypothesisDeps]") -> dict:
+        """Return theme frequency percentages and per-theme sentiment breakdown."""
+        return {
+            "theme_pct": ctx.deps.analysis.get("theme_pct", {}),
+            "theme_by_sentiment": ctx.deps.analysis.get("theme_by_sentiment", {}),
+        }
+
+    def get_rating_data(ctx: "RunContext[HypothesisDeps]") -> dict:
+        """Return rating statistics: overall rating, sample average, and distribution."""
+        return {
+            "restaurant_name": ctx.deps.analysis.get("restaurant_name", ""),
+            "overall_rating": ctx.deps.analysis.get("overall_rating"),
+            "avg_rating_from_sample": ctx.deps.analysis.get("avg_rating_from_sample"),
+            "rating_distribution": ctx.deps.analysis.get("rating_distribution", {}),
+            "total_ratings_on_google": ctx.deps.analysis.get("total_ratings_on_google"),
+        }
+
+    _HYPOTHESIS_TOOLS = [get_sentiment_data, get_theme_data, get_rating_data]
+    _HYPOTHESIS_SYSTEM_PROMPT = (
+        "You are a restaurant data analyst. Use the three available tools "
+        "(get_sentiment_data, get_theme_data, get_rating_data) to retrieve "
+        "EDA results, then write a concise 2–3 sentence data-backed "
+        "hypothesis about the restaurant's key strengths and main area for "
+        "improvement. Always reference specific percentages and numbers."
+    )
 
 # ---------------------------------------------------------------------------
 # Theme keyword map
@@ -356,23 +421,60 @@ class AnalysisAgent:
 
 
 # ---------------------------------------------------------------------------
-# HypothesisAgent  (rule-based, no LLM)
+# HypothesisAgent  (Google ADK + Gemini, with rule-based fallback)
 # ---------------------------------------------------------------------------
 class HypothesisAgent:
     """
-    Forms a data-backed hypothesis from the EDA output using deterministic
-    rules.  No LLM / API key required.
+    Generates a data-backed hypothesis from the EDA output.
 
-    Rules (in priority order):
+    Primary path (requires ANTHROPIC_API_KEY):
+      Uses a PydanticAI Agent backed by Claude claude-haiku-4-5 (Anthropic).
+      The agent calls three @agent.tool-decorated functions—get_sentiment_data,
+      get_theme_data, get_rating_data—which receive typed analysis data through
+      PydanticAI's RunContext dependency-injection system, then synthesises a
+      concise hypothesis in natural language.
+
+    Fallback path (no API key / pydantic-ai unavailable):
+      Deterministic rule-based logic using the same EDA values so the
+      pipeline always produces output.
+
+    Rules (fallback, in priority order):
       1. Strong positive signal  (positive% ≥ 60)
       2. Strong negative signal  (negative% ≥ 40)
       3. Mixed / balanced signal
-
-    The hypothesis references specific numbers from the analysis so it is
-    grounded in the collected data, not model weights.
     """
 
-    def generate_hypothesis(self, analysis: dict) -> str:
+    # ------------------------------------------------------------------
+    # LLM path via PydanticAI
+    # ------------------------------------------------------------------
+
+    def _pydanticai_hypothesis(self, analysis: dict) -> str:
+        """Build a PydanticAI Agent on demand and return its hypothesis text.
+
+        The Agent is constructed here (not at import time) so that the
+        Anthropic provider only reads ANTHROPIC_API_KEY when it is actually
+        needed, avoiding import-time failures when the key is absent.
+        """
+        agent: Agent[HypothesisDeps, str] = Agent(
+            "anthropic:claude-haiku-4-5-20251001",
+            deps_type=HypothesisDeps,
+            system_prompt=_HYPOTHESIS_SYSTEM_PROMPT,
+            tools=_HYPOTHESIS_TOOLS,
+        )
+        deps = HypothesisDeps(analysis=analysis)
+        name = analysis.get("restaurant_name", "Unknown")
+        result = agent.run_sync(
+            f"Generate a data-backed hypothesis for restaurant: {name}. "
+            f"Use the available tools to retrieve the data first.",
+            deps=deps,
+        )
+        return result.data
+
+    # ------------------------------------------------------------------
+    # Rule-based fallback
+    # ------------------------------------------------------------------
+
+    def _rule_based_hypothesis(self, analysis: dict) -> str:
         sp = analysis["sentiment_pct"]
         tp = analysis["theme_pct"]
         pos = sp.get("positive", 0)
@@ -384,12 +486,10 @@ class HypothesisAgent:
         overall = analysis.get("overall_rating")
         total_google = analysis.get("total_ratings_on_google")
 
-        # Most-mentioned theme
         top_theme = max(tp, key=lambda k: tp[k]) if tp else "food_quality"
         top_label = top_theme.replace("_", " ")
         top_pct = tp.get(top_theme, 0)
 
-        # Most negatively-skewed theme
         tbs = analysis.get("theme_by_sentiment", {})
         worst_theme = top_theme
         worst_neg_ratio = 0.0
@@ -400,17 +500,14 @@ class HypothesisAgent:
                 worst_theme, worst_neg_ratio = theme, ratio
         worst_label = worst_theme.replace("_", " ")
 
-        # Google overall rating context
         google_ctx = ""
         if overall and total_google:
             google_ctx = (
-                f" (Google overall: {overall}/5 across "
-                f"{total_google:,} ratings)"
+                f" (Google overall: {overall}/5 across {total_google:,} ratings)"
             )
         elif overall:
             google_ctx = f" (Google overall rating: {overall}/5)"
 
-        # --- Rule 1: clearly positive ---
         if pos >= 60:
             return (
                 f"Based on {total} sampled reviews, {name} enjoys a "
@@ -422,7 +519,6 @@ class HypothesisAgent:
                 f"satisfaction."
             )
 
-        # --- Rule 2: clearly negative ---
         if neg >= 40:
             return (
                 f"Based on {total} sampled reviews, {name} faces notable "
@@ -433,7 +529,6 @@ class HypothesisAgent:
                 f"{worst_label}, which appears to be the primary pain point."
             )
 
-        # --- Rule 3: mixed ---
         return (
             f"Reviews for {name} are mixed{google_ctx}: "
             f"{pos:.0f}% positive, {neg:.0f}% negative, {neu:.0f}% neutral "
@@ -443,6 +538,18 @@ class HypothesisAgent:
             f"highest proportion of negative mentions, suggesting it as the "
             f"key area for improvement."
         )
+
+    # ------------------------------------------------------------------
+    # Public interface
+    # ------------------------------------------------------------------
+
+    def generate_hypothesis(self, analysis: dict) -> str:
+        if _PYDANTIC_AI_AVAILABLE and os.environ.get("ANTHROPIC_API_KEY"):
+            try:
+                return self._pydanticai_hypothesis(analysis)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[HypothesisAgent] PydanticAI call failed ({exc}); using rule-based fallback.")
+        return self._rule_based_hypothesis(analysis)
 
     def run(self, analysis: dict) -> str:
         return self.generate_hypothesis(analysis)
