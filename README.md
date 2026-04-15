@@ -2,7 +2,8 @@
 
 A **multi-agent restaurant review analyst** that fetches real Google Places reviews at runtime, runs exploratory data analysis (EDA), and generates data-backed hypotheses about customer experience.
 
-## App Link: https://data-analyst-frontend-v2-940502312023.us-central1.run.app
+## App Link: 
+https://data-analyst-frontend-v2-940502312023.us-central1.run.app
 
 ## Architecture
 
