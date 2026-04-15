@@ -1,18 +1,18 @@
 steps:
   - name: 'gcr.io/cloud-builders/docker'
-    args: ['build', '-f', 'Dockerfile.backend', '-t', 'gcr.io/$PROJECT_ID/data-analyst-backend', '.']
+    args: ['build', '-f', 'Dockerfile.backend', '-t', 'gcr.io/$PROJECT_ID/data-analyst-backend-v2', '.']
 
   - name: 'gcr.io/cloud-builders/docker'
-    args: ['push', 'gcr.io/$PROJECT_ID/data-analyst-backend']
+    args: ['push', 'gcr.io/$PROJECT_ID/data-analyst-backend-v2']
 
   - name: 'gcr.io/cloud-builders/gcloud'
     args:
       - 'run'
       - 'deploy'
-      - 'data-analyst-backend'
-      - '--image=gcr.io/$PROJECT_ID/data-analyst-backend'
+      - 'data-analyst-backend-v2'
+      - '--image=gcr.io/$PROJECT_ID/data-analyst-backend-v2'
       - '--region=us-central1'
       - '--allow-unauthenticated'
       - '--port=8080'
-      # Pulls secret from Secret Manager at deploy time (never hardcode secrets in yaml)
-      - '--update-secrets=GOOGLE_PLACES_API_KEY=GOOGLE_PLACES_API_KEY:latest'
+      # Pulls secrets from Secret Manager at deploy time (never hardcode secrets in yaml)
+      - '--update-secrets=GOOGLE_PLACES_API_KEY=GOOGLE_PLACES_API_KEY:latest,ANTHROPIC_API_KEY=ANTHROPIC_API_KEY:latest'
